@@ -9,6 +9,9 @@ end of day" scope. Reads whatever is currently in observations.db.
 """
 
 import json
+import tempfile
+from pathlib import Path
+
 import streamlit as st
 
 import db
@@ -22,12 +25,48 @@ st.caption(
     "Reports visible behavior only — not a medical diagnosis."
 )
 
+UPLOAD_DIR = Path(tempfile.gettempdir()) / "zoosentry_uploads"
+
 with st.sidebar:
     st.header("Run a shift")
-    folder = st.text_input("Clips folder (leave blank for demo data)", "")
+
+    source = st.radio(
+        "Clip source",
+        ["Upload files", "Folder path on this machine"],
+        label_visibility="collapsed",
+    )
+
+    uploaded_files = None
+    folder = None
+
+    if source == "Upload files":
+        uploaded_files = st.file_uploader(
+            "Drop any .mp4 clips here",
+            type=["mp4"],
+            accept_multiple_files=True,
+        )
+    else:
+        folder = st.text_input("Clips folder (leave blank for demo data)", "")
+
     if st.button("Analyze shift", type="primary"):
+        target_folder = None
+
+        if source == "Upload files":
+            if not uploaded_files:
+                st.warning("Upload at least one .mp4 file first.")
+                st.stop()
+
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            for f in UPLOAD_DIR.glob("*.mp4"):
+                f.unlink()  # clear out any previous shift's clips
+            for f in uploaded_files:
+                (UPLOAD_DIR / f.name).write_bytes(f.getbuffer())
+            target_folder = str(UPLOAD_DIR)
+        else:
+            target_folder = folder or None
+
         with st.spinner("Uploading clips to VSS and analyzing..."):
-            packet, brief = ingest.run(folder or None, reset=True)
+            packet, brief = ingest.run(target_folder, reset=True)
         st.success("Done.")
 
 observations = db.all_observations()

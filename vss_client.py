@@ -1,19 +1,17 @@
 """
 ZooSentry — VSS client.
 
-Today: no VSS deployment exists, so this returns realistic MOCK responses
-shaped exactly like what the real VSS Agent API returns, per the design doc
-(section 5, 7):
+Talks to a real NVIDIA VSS instance (dev-profile-base, edge deployment e.g.
+DGX Spark) using the actual VSS REST API:
 
-    POST {VSS_BASE_URL}/api/v1/videos          -> upload/register a clip
-    POST {VSS_BASE_URL}/chat  (or /generate)    -> behavior-extraction Q&A
+    POST {VSS_BASE_URL}/files              -> upload a clip, returns a file id
+    POST {VSS_BASE_URL}/summarize          -> behavior-extraction "summary" call
+    POST {VSS_BASE_URL}/chat/completions   -> follow-up Q&A on an ingested clip
 
-When you have a real VSS instance:
-    1. Set VSS_BASE_URL (env var or below).
-    2. Flip USE_MOCK = False.
-    3. The real request/response code is already written below (commented) —
-       uncomment it. Nothing else in the pipeline needs to change, because
-       upload_video() and analyze_clip() keep the same return shape either way.
+Auth: Bearer token via the Authorization header (set VSS_API_KEY).
+
+Set USE_MOCK = True (or env var VSS_USE_MOCK=1) to fall back to fabricated
+responses when no VSS instance is reachable — useful for offline dev/demo.
 """
 
 import os
@@ -21,8 +19,26 @@ import json
 import random
 import time
 
-VSS_BASE_URL = os.environ.get("VSS_BASE_URL", "http://localhost:8100")
-USE_MOCK = True  # flip to False once a real VSS endpoint exists
+import requests
+
+VSS_BASE_URL = os.environ.get("VSS_BASE_URL", "http://localhost:8100").rstrip("/")
+VSS_API_KEY = os.environ.get("VSS_API_KEY", "")
+VSS_MODEL = os.environ.get("VSS_MODEL", "cosmos-reason2")
+
+# Live by default now that a real VSS endpoint + key are available.
+# Set VSS_USE_MOCK=1 in the environment to force offline mock mode.
+USE_MOCK = os.environ.get("VSS_USE_MOCK", "0") == "1"
+
+REQUEST_TIMEOUT_UPLOAD = 120
+REQUEST_TIMEOUT_SUMMARIZE = 180
+REQUEST_TIMEOUT_CHAT = 120
+
+
+def _auth_headers() -> dict:
+    headers = {}
+    if VSS_API_KEY:
+        headers["Authorization"] = f"Bearer {VSS_API_KEY}"
+    return headers
 
 BEHAVIOR_EXTRACTION_PROMPT = """You are reviewing chimpanzee enclosure footage for a zoo worker.
 
@@ -120,7 +136,7 @@ def _mock_analyze(video_id: str) -> dict:
 
 def upload_video(filepath: str) -> dict:
     """
-    Register a clip with VSS.
+    Upload a clip to VSS via POST /files.
     Returns: {"video_id", "filename", "vss_sensor_id", "status"}
     """
     filename = os.path.basename(filepath)
@@ -128,51 +144,64 @@ def upload_video(filepath: str) -> dict:
     if USE_MOCK:
         return _mock_upload(filename)
 
-    # --- Real VSS call (uncomment when VSS_BASE_URL is live) ---
-    # import requests
-    # with open(filepath, "rb") as f:
-    #     resp = requests.post(
-    #         f"{VSS_BASE_URL}/api/v1/videos",
-    #         files={"file": (filename, f, "video/mp4")},
-    #         timeout=120,
-    #     )
-    # resp.raise_for_status()
-    # data = resp.json()
-    # return {
-    #     "video_id": data["video_id"],
-    #     "filename": filename,
-    #     "vss_sensor_id": data.get("sensor_id"),
-    #     "status": "uploaded",
-    # }
+    with open(filepath, "rb") as f:
+        resp = requests.post(
+            f"{VSS_BASE_URL}/files",
+            headers=_auth_headers(),
+            data={"purpose": "vision", "media_type": "video"},
+            files={"file": (filename, f, "video/mp4")},
+            timeout=REQUEST_TIMEOUT_UPLOAD,
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    return {
+        "video_id": data["id"],
+        "filename": filename,
+        "vss_sensor_id": data.get("id"),
+        "status": "uploaded",
+    }
 
 
 def analyze_clip(video_id: str) -> dict:
     """
-    Ask the VSS agent (Cosmos3 Nano Reasoner under the hood) to extract
-    behaviors from a previously-uploaded clip.
+    Ask VSS (Cosmos Reason under the hood) to extract behaviors from a
+    previously-uploaded clip via POST /summarize.
     Returns: {"clip_summary": str, "events": [ {...}, ... ]}
     """
     if USE_MOCK:
         time.sleep(0.05)  # simulate latency
         return _mock_analyze(video_id)
 
-    # --- Real VSS call (uncomment when VSS_BASE_URL is live) ---
-    # import requests
-    # resp = requests.post(
-    #     f"{VSS_BASE_URL}/chat",
-    #     json={
-    #         "id": video_id,
-    #         "prompt": BEHAVIOR_EXTRACTION_PROMPT,
-    #     },
-    #     timeout=180,
-    # )
-    # resp.raise_for_status()
-    # text = resp.json()["choices"][0]["message"]["content"]
-    # return json.loads(text)
+    body = {
+        "id": video_id,
+        "prompt": BEHAVIOR_EXTRACTION_PROMPT,
+        "caption_summarization_prompt": (
+            "Combine sequential captions of visible chimpanzee behavior into a "
+            "single structured JSON event list matching the requested schema."
+        ),
+        "summary_aggregation_prompt": (
+            "Return only the final JSON object matching the requested schema. "
+            "No prose outside the JSON."
+        ),
+        "model": VSS_MODEL,
+        "max_tokens": 1536,
+        "temperature": 0.2,
+        "top_p": 0.3,
+        "chunk_duration": 20,
+    }
+    resp = requests.post(
+        f"{VSS_BASE_URL}/summarize",
+        headers=_auth_headers(),
+        json=body,
+        timeout=REQUEST_TIMEOUT_SUMMARIZE,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+    return _parse_behavior_json(content)
 
 
 def ask_followup(video_id: str, question: str) -> str:
-    """Follow-up Q&A about a specific clip, routed through VSS."""
+    """Follow-up Q&A about a specific clip via POST /chat/completions."""
     if USE_MOCK:
         return (
             f"[MOCK VSS RESPONSE for {video_id}] In the moments before the event, "
@@ -180,12 +209,43 @@ def ask_followup(video_id: str, question: str) -> str:
             f"with no visible separation beforehand."
         )
 
-    # --- Real VSS call (uncomment when VSS_BASE_URL is live) ---
-    # import requests
-    # resp = requests.post(
-    #     f"{VSS_BASE_URL}/chat",
-    #     json={"id": video_id, "prompt": question},
-    #     timeout=180,
-    # )
-    # resp.raise_for_status()
-    # return resp.json()["choices"][0]["message"]["content"]
+    payload = {
+        "id": video_id,
+        "messages": [{"content": question, "role": "user"}],
+        "model": VSS_MODEL,
+    }
+    resp = requests.post(
+        f"{VSS_BASE_URL}/chat/completions",
+        headers=_auth_headers(),
+        json=payload,
+        timeout=REQUEST_TIMEOUT_CHAT,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def _parse_behavior_json(raw_text: str) -> dict:
+    """
+    Cosmos/Nemotron sometimes wrap JSON in markdown fences or add stray text.
+    Strip that before parsing, and fail loudly (with the raw text) if the
+    model didn't return valid JSON, since the design doc's prompt asks for
+    JSON-only output and downstream code assumes it.
+    """
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"VSS did not return valid JSON for behavior extraction.\n"
+            f"Raw response was:\n{raw_text}"
+        ) from e
+
+    parsed.setdefault("clip_summary", "")
+    parsed.setdefault("events", [])
+    return parsed

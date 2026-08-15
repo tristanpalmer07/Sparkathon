@@ -1,23 +1,28 @@
 """
 ZooSentry — Nemotron client.
 
-Today: mocked. Produces a shift brief from the structured event packet
-using simple templating instead of a real LLM call.
+Talks to NVIDIA's hosted OpenAI-compatible API for
+nvidia/nvidia-nemotron-nano-9b-v2 to turn the structured shift event packet
+into a worker-facing brief.
 
-When you have an NVIDIA API key:
-    1. Set NVIDIA_API_KEY (env var).
-    2. Flip USE_MOCK = False.
-    3. Uncomment the real call below (OpenAI-compatible endpoint for
-       nvidia/nvidia-nemotron-nano-9b-v2, per design doc section 11).
+Live by default once NVIDIA_API_KEY is set. Set NEMOTRON_USE_MOCK=1 to force
+the offline templated fallback (useful for demos without network access).
 """
 
 import os
 import json
 
+import requests
+
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-NVIDIA_API_BASE = "https://integrate.api.nvidia.com/v1"
-MODEL = "nvidia/nvidia-nemotron-nano-9b-v2"
-USE_MOCK = True
+NVIDIA_API_BASE = os.environ.get("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1")
+MODEL = os.environ.get("NEMOTRON_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
+
+# Live by default now that NVIDIA_API_KEY can be set. Force offline mock
+# with NEMOTRON_USE_MOCK=1, or automatically fall back if no key is set.
+USE_MOCK = os.environ.get("NEMOTRON_USE_MOCK", "0") == "1" or not NVIDIA_API_KEY
+
+REQUEST_TIMEOUT = 60
 
 SHIFT_BRIEF_PROMPT = """You are producing a shift handover brief for a zoo worker.
 
@@ -92,21 +97,50 @@ def generate_shift_brief(event_packet: dict) -> dict:
     if USE_MOCK:
         return _mock_brief(event_packet)
 
-    # --- Real Nemotron call (uncomment when NVIDIA_API_KEY is set) ---
-    # import requests
-    # resp = requests.post(
-    #     f"{NVIDIA_API_BASE}/chat/completions",
-    #     headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
-    #     json={
-    #         "model": MODEL,
-    #         "messages": [
-    #             {"role": "system", "content": SHIFT_BRIEF_PROMPT},
-    #             {"role": "user", "content": json.dumps(event_packet)},
-    #         ],
-    #         "temperature": 0.2,
-    #     },
-    #     timeout=60,
-    # )
-    # resp.raise_for_status()
-    # text = resp.json()["choices"][0]["message"]["content"]
-    # return json.loads(text)
+    resp = requests.post(
+        f"{NVIDIA_API_BASE}/chat/completions",
+        headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
+        json={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": SHIFT_BRIEF_PROMPT},
+                {"role": "user", "content": json.dumps(event_packet)},
+            ],
+            "temperature": 0.2,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+    return _parse_brief_json(content)
+
+
+def _parse_brief_json(raw_text: str) -> dict:
+    """
+    Strip markdown fences if Nemotron wraps its JSON, and fail loudly with
+    the raw text included if it still doesn't parse, since the prompt asks
+    for JSON-only output and the dashboard assumes these keys exist.
+    """
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Nemotron did not return valid JSON for the shift brief.\n"
+            f"Raw response was:\n{raw_text}"
+        ) from e
+
+    # Ensure every key app.py reads is present, even if Nemotron omitted one.
+    parsed.setdefault("headline", "")
+    parsed.setdefault("review_first", [])
+    parsed.setdefault("shift_summary", "")
+    parsed.setdefault("social_activity_summary", "")
+    parsed.setdefault("feeding_activity_summary", "")
+    parsed.setdefault("activity_summary", "")
+    return parsed
