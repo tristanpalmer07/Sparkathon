@@ -121,11 +121,14 @@ if not flagged:
     st.write("Nothing flagged for review this shift.")
 for obs in flagged:
     with st.container(border=True):
-        st.markdown(f"**{LABELS[obs['priority']]} — {obs['behavior']}**  "
+        corroborated_badge = " ✓ corroborated" if obs.get("corroborated") else ""
+        st.markdown(f"**{LABELS[obs['priority']]} — {obs['behavior']}**{corroborated_badge}  "
                      f"({obs['video_id']}, {obs['start_s']:.0f}s–{obs['end_s']:.0f}s)")
-        st.write(obs["description"])
+        st.write(obs.get("vlm_description") or obs["description"])
+        source_note = f" · Source: {obs.get('source', 'vss')}"
+        track_note = f" · Track {obs['track_id']}" if obs.get("track_id") else ""
         st.caption(f"Animals visible: {obs['animals_visible']} · "
-                     f"Model confidence: {obs['model_confidence']}")
+                     f"Model confidence: {obs['model_confidence']}{source_note}{track_note}")
 
 st.divider()
 

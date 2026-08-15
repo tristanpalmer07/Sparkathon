@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS observations (
     model_confidence TEXT,
     priority INTEGER DEFAULT 0,
     raw_response TEXT,
+    source TEXT DEFAULT 'vss',
+    track_id TEXT,
+    vlm_description TEXT,
+    corroborated INTEGER DEFAULT 0,
     FOREIGN KEY (video_id) REFERENCES videos(video_id)
 );
 
@@ -86,17 +90,21 @@ def upsert_video(video_id: str, filename: str, vss_sensor_id: str | None,
 
 def insert_observation(video_id: str, start_s: float, end_s: float, behavior: str,
                         animals_visible: str, description: str, model_confidence: str,
-                        priority: int, raw_response: dict):
+                        priority: int, raw_response: dict, source: str = "vss",
+                        track_id: str | None = None, vlm_description: str | None = None,
+                        corroborated: bool = False):
     with get_conn() as conn:
         conn.execute(
             """
             INSERT INTO observations
                 (video_id, start_s, end_s, behavior, animals_visible,
-                 description, model_confidence, priority, raw_response)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 description, model_confidence, priority, raw_response,
+                 source, track_id, vlm_description, corroborated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (video_id, start_s, end_s, behavior, animals_visible,
-             description, model_confidence, priority, json.dumps(raw_response)),
+             description, model_confidence, priority, json.dumps(raw_response),
+             source, track_id, vlm_description, int(corroborated)),
         )
 
 
@@ -128,5 +136,3 @@ def latest_shift_brief():
             "SELECT * FROM shift_briefs ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
-
-    
