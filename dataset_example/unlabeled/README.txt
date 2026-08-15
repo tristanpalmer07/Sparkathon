@@ -1,1 +1,0 @@
-To comply with licensing restrictions, we have removed the audio from the raw video data.
