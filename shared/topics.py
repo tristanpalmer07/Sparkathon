@@ -1,0 +1,5 @@
+ALPHACHIMP_EVENTS = "alphachimp-events"
+CANDIDATE_CLIPS = "candidate-clips"
+CLIP_READY = "clip-ready"
+VLM_DESCRIPTIONS = "vlm-descriptions"
+NEMOTRON_VERDICTS = "nemotron-verdicts"

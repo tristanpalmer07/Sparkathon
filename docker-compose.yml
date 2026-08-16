@@ -1,0 +1,223 @@
+x-vss-host: &vss-host
+  # VSS's real Kafka (confluentinc/cp-kafka, deploy/docker/services/infra/
+  # compose.yml) and VIOS ingress both run with network_mode: host inside
+  # the VSS deployment, so we reach them via the Docker host gateway
+  # rather than a service name on our own bridge network.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+x-kafka-env: &kafka-env
+  KAFKA_BOOTSTRAP_SERVERS: host.docker.internal:9092
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: events
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports: ["5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: creates our 5 custom topics on VSS's real Kafka broker,
+  # which runs with KAFKA_AUTO_CREATE_TOPICS_ENABLE=false.
+  kafka-topics-init:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: scripts/Dockerfile
+    environment:
+      <<: *kafka-env
+    command: ["python", "init_topics.py"]
+
+  video-ingest:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: services/video-ingest/Dockerfile
+    environment:
+      <<: *kafka-env
+      WINDOW_FRAMES: "12"
+      WINDOW_STRIDE: "24"
+      CAMERA_ID: enc_a
+      DATASET_PATH: /data/chimp_demo_h264.mp4
+      ALPHACHIMP_URL: http://alphachimp:8080/infer
+      VIOS_ENDPOINT: http://host.docker.internal:30888
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+      alphachimp: { condition: service_started }
+
+  alphachimp:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: services/alphachimp/Dockerfile.pytorch
+    environment:
+      <<: *kafka-env
+      MODEL_BACKEND: pytorch
+      # Same res576 weights; infer256 only changes the val resize to
+      # 256 so each forward is much cheaper. No separate 256 ckpt on disk.
+      ALPHACHIMP_CONFIG: /app/AlphaChimp/configs/alphachimp/alphachimp_infer256.py
+    ports: ["8080:8080"]
+    volumes:
+      # checkpoint lives outside the repo (1.3GB) — mounted, not baked
+      # into the image.
+      - /home/acer01/Desktop/big-files/alphachimp_res576.pth:/checkpoints/alphachimp_res576.pth:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+
+  nvframe-adapter:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: services/nvframe-adapter/Dockerfile
+    environment:
+      <<: *kafka-env
+      MDX_RAW_TOPIC: mdx-raw
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+
+  event-evaluator:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: services/event-evaluator/Dockerfile
+    environment:
+      <<: *kafka-env
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+
+  clip-retrieval:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: services/clip-retrieval/Dockerfile
+    environment:
+      <<: *kafka-env
+      VIOS_ENDPOINT: http://host.docker.internal:30888
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+
+  cosmos-vlm:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: services/cosmos-vlm/Dockerfile
+    environment:
+      <<: *kafka-env
+      # Standalone nvidia/cosmos-reason2-8b NIM (1.6.0), started outside
+      # this compose per README.md "Tying into VSS". Published on 8018,
+      # not the service's own 30082 default — dev-profile-lvs/.env sets
+      # VLM_PORT=8018 for its RT-VLM service, and our resolved.yml reused
+      # that same var for this NIM's port mapping too.
+      COSMOS_NIM_URL: http://host.docker.internal:8018/v1/chat/completions
+      COSMOS_MODEL_NAME: nvidia/cosmos-reason2-8b
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+
+  nemotron-triage:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: services/nemotron-triage/Dockerfile
+    environment:
+      <<: *kafka-env
+      # Standalone DGX-Spark Nemotron Nano 9B NIM, started outside this
+      # compose per edge.md's recipe (LLM_MODE=remote, localhost:30081).
+      NEMOTRON_NIM_URL: http://host.docker.internal:30081/v1/chat/completions
+      NEMOTRON_MODEL_NAME: nvidia/nemotron-nano-9b-v2
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+
+  event-writer:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: services/event-writer/Dockerfile
+    environment:
+      <<: *kafka-env
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/events
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+
+  alerts:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: services/alerts/Dockerfile
+    environment:
+      <<: *kafka-env
+      # ALERT_WEBHOOK_URL: https://example.com/webhook  # optional; logs regardless
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+
+  events-api:
+    build:
+      context: .
+      dockerfile: services/events-api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/events
+    ports: ["8001:8001"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # Drives video-ingest (a one-shot CLI job) from HTTP: lists a demo
+  # video library + browser uploads, transcodes to H.264 if needed,
+  # and shells out `docker compose run video-ingest` over the mounted
+  # host docker socket. See services/ingest-api/main.py's docstring for
+  # why PROJECT_DIR is bind-mounted at its own identical host path
+  # (required for docker-outside-of-docker bind-mount resolution).
+  ingest-api:
+    build:
+      context: .
+      dockerfile: services/ingest-api/Dockerfile
+    environment:
+      PROJECT_DIR: /home/acer01/primate-event-intelligence
+      LIBRARY_DIR: /library
+    ports: ["8002:8002"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/acer01/primate-event-intelligence:/home/acer01/primate-event-intelligence
+      - /home/acer01/Desktop/big-files/ChimpACT_release_v1/videos_full:/library:ro
+
+  frontend:
+    build:
+      context: services/frontend
+      dockerfile: Dockerfile
+    ports: ["3000:80"]
+    depends_on:
+      - events-api
+      - ingest-api
+
+  test-client:
+    <<: *vss-host
+    build:
+      context: .
+      dockerfile: scripts/Dockerfile
+    profiles: ["tools"]
+    environment:
+      <<: *kafka-env
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/events
+    depends_on:
+      kafka-topics-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+
+volumes:
+  postgres-data:

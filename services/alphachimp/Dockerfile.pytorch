@@ -1,0 +1,64 @@
+# Real-model image — MODEL_BACKEND=pytorch. Runs the actual AlphaChimp
+# checkpoint natively on this box's aarch64/GB10 (Blackwell) hardware.
+#
+# The original repo pins torch==1.9.1+cu111 (x86_64-only wheels, no
+# ARM64 build ever existed for that combo) — that pin is unusable here
+# regardless of what §5.1 originally sketched. Instead we use NVIDIA's
+# own PyTorch NGC container, which ships a torch build tested against
+# this exact GPU (confirmed: torch.cuda.get_device_capability() ->
+# (12, 1), matmul runs clean). The vendored mmdet/mmtracking/mmaction
+# fork has no custom compiled CUDA kernels of its own (verified: no
+# .cu/.cpp files outside setup.py) — it only depends on mmcv's ops,
+# which we build from source against this modern torch/CUDA instead of
+# fetching mmcv's (nonexistent, for this combo) prebuilt wheel.
+FROM nvcr.io/nvidia/pytorch:25.09-py3
+
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/AlphaChimp
+COPY services/alphachimp/AlphaChimp/ ./
+
+# Range from this repo's own requirements/mminstall.txt — mmcv must be
+# < 2.2.0 for this fork's registry usage; build from source (no
+# matching prebuilt wheel exists for aarch64 + CUDA 13 + torch 2.9).
+#
+# FORCE_CUDA=1 is load-bearing: `docker build` has no GPU visible, so
+# mmcv's setup.py — which gates CUDA-extension compilation behind
+# `torch.cuda.is_available()`, not just MMCV_WITH_OPS — silently built
+# CPU-only ops without it (symptom: "ms_deform_attn_impl_forward:
+# implementation for device cuda:0 not found" at inference time, no
+# build-time error). TORCH_CUDA_ARCH_LIST is inherited from the base
+# image (8.0 8.6 9.0 10.0 11.0 12.0+PTX) and already covers this GPU
+# (compute capability 12.1) via the 12.0 PTX forward-compat fallback.
+ENV MMCV_WITH_OPS=1
+ENV FORCE_CUDA=1
+RUN pip install --no-cache-dir "mmengine>=0.7.1,<1.0.0" \
+ && pip install --no-cache-dir --no-build-isolation "mmcv>=2.0.0rc4,<2.2.0"
+
+# install_requires only (requirements/build.txt) — deliberately not
+# requirements/alphachimp.txt's exact pins, several of which
+# (nvidia-*-cu12 pip wheels, an old triton pin) are x86_64-only and
+# redundant with what the NGC base image already ships natively.
+# decord (used only by DecordInit/DecordDecode, a video-file-reading
+# transform we don't use — our val_pipeline uses RawFrameDecode against
+# pre-extracted JPGs instead) has no aarch64 wheels on PyPI at all;
+# skip it rather than chase a source build for an unused code path.
+RUN pip install --no-cache-dir -v -e . --no-deps \
+ && pip install --no-cache-dir einops matplotlib "numpy<2" opencv-contrib-python Pillow scipy
+
+# Runtime deps actually imported by inference (found empirically —
+# addict/terminaltables/shapely/pycocotools/lap/motmetrics aren't
+# pulled in by install_requires but are used by the config/eval code).
+RUN pip install --no-cache-dir addict terminaltables shapely pycocotools lap motmetrics einops
+
+WORKDIR /app
+COPY shared/ ./shared/
+COPY services/alphachimp/ ./services/alphachimp/
+WORKDIR /app/services/alphachimp
+RUN pip install --no-cache-dir fastapi "uvicorn[standard]" kafka-python pydantic
+
+ENV MODEL_BACKEND=pytorch
+ENV ALPHACHIMP_CONFIG=/app/AlphaChimp/configs/alphachimp/alphachimp_infer256.py
+ENV ALPHACHIMP_CHECKPOINT=/checkpoints/alphachimp_res576.pth
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

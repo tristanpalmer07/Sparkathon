@@ -1,0 +1,4 @@
+pydantic>=2.6,<3
+kafka-python>=2.0,<3
+protobuf>=5.27,<6
+grpcio-tools>=1.62,<2
