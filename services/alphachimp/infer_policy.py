@@ -19,7 +19,10 @@ def center_index(n_frames: int) -> int:
 
 
 def keep_only_center(items: Sequence[T], n_frames: int) -> list[T]:
-    return [items[center_index(n_frames)]]
+    if not items:
+        return []
+    idx = min(center_index(n_frames), len(items) - 1)
+    return [items[idx]]
 
 
 def place_at_center(n_frames: int, detections: T) -> list[T | list]:

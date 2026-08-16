@@ -240,6 +240,9 @@ class PyTorchBackend:
             dataset_cfg["data_prefix"] = dict(img=str(tmp))
             dataset_cfg["test_mode"] = True
             dataset = DATASETS.build(dataset_cfg)
+            # mmengine datasets lazy-load; data_list is empty until this.
+            if hasattr(dataset, "full_init"):
+                dataset.full_init()
             # One detector forward on the center timestamp. Neighbor
             # JPGs stay on disk so SampleAVAFrames can still build its
             # 8-frame temporal clip.

@@ -17,6 +17,15 @@ def test_keep_only_center_drops_other_dataset_items():
     assert keep_only_center(items, 12) == [{"timestamp": 6}]
 
 
+def test_keep_only_center_empty_list_does_not_raise():
+    assert keep_only_center([], 12) == []
+
+
+def test_keep_only_center_clamps_when_dataset_is_shorter_than_window():
+    items = [{"timestamp": 0}, {"timestamp": 1}]
+    assert keep_only_center(items, 12) == [{"timestamp": 1}]
+
+
 def test_place_at_center_leaves_other_frames_empty():
     dets = ["center-only"]
     placed = place_at_center(12, dets)
