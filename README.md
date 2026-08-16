@@ -1,8 +1,8 @@
-# Primate Event Intelligence on NVIDIA DGX Spark
+# Zoo Sentry on NVIDIA DGX Spark
 
 **Hackathon repository:** https://github.com/tristanpalmer07/Sparkathon
 
-Primate Event Intelligence is an event-driven video understanding pipeline for chimpanzee monitoring. It combines a domain-specific perception model (**AlphaChimp**) with NVIDIA video infrastructure and reasoning models to turn raw footage into structured, reviewable events.
+Zoo Sentry is an event-driven video understanding pipeline for chimpanzee monitoring. It combines a domain-specific perception model (**AlphaChimp**) with NVIDIA video infrastructure and reasoning models to turn raw footage into structured, reviewable events.
 
 The core idea is simple:
 
