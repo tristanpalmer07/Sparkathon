@@ -1,207 +1,583 @@
-# Primate Event Intelligence
+# Primate Event Intelligence on NVIDIA DGX Spark
 
-Full pipeline from the design doc, **every stage running the real
-component** on this box:
+**Hackathon repository:** https://github.com/tristanpalmer07/Sparkathon
 
-**Chimp video → real AlphaChimp detection/tracking/behavior → nv.Frame
-→ real VSS behavior-analytics (+ custom Event Evaluator) → real VIOS
-clip retrieval → real Cosmos-Reason2-8B VLM → real Nemotron NIM
-reasoning → Postgres `events` → Events API → Alerts.**
+Primate Event Intelligence is an event-driven video understanding pipeline for chimpanzee monitoring. It combines a domain-specific perception model (**AlphaChimp**) with NVIDIA video infrastructure and reasoning models to turn raw footage into structured, reviewable events.
 
-Verified end-to-end on 2026-08-16, including a full run over the
-AlphaChimp repo's own real chimp demo footage.
+The core idea is simple:
 
-## What's real
+> **AlphaChimp sees → deterministic rules decide what is interesting → NVIDIA Cosmos describes the evidence → NVIDIA Nemotron judges the event → the result is stored, alerted, and exposed through an API.**
 
-| Piece | Status |
-|---|---|
-| **AlphaChimp Inference** | **Real model, real checkpoint, real GPU inference.** DINO detector + SwinTransformer3D-Large backbone + ByteTrack, running the actual `alphachimp_res576.pth` checkpoint on this box's aarch64/GB10 hardware. See "Porting AlphaChimp to ARM64" below. |
-| Event Evaluator | Real rule engine (§3.1), unit-tested, using the model's actual 24-class behavior taxonomy (`aggressing`, `resting`, `grooming`, `displaying`, ...). |
-| AlphaChimp → nv.Frame Adapter | Real. Publishes genuine `nv.Frame` protobuf onto VSS's real `mdx-raw` topic — verified consumed live by a real `vss-behavior-analytics` instance. |
-| Video Ingest / Clip Retrieval | Real VIOS integration — uploads via `PUT /storage/file/...`, resolves clip URLs via `GET /storage/timelines` + `GET /storage/file/<streamId>/url` (see streamId-resolution note below). |
-| Cosmos VLM | Real `nvcr.io/nim/nvidia/cosmos-reason2-8b:1.6.0` NIM, port 8018. |
-| Nemotron Triage | Real `nvcr.io/nim/nvidia/nvidia-nemotron-nano-9b-v2-dgx-spark:1.0.0-variant` NIM, port 30081. |
-| Event Writer | Real — writes every verdict to Postgres per the frozen `events` schema (§4.2). |
-| Alerts | Real — consumes `nemotron-verdicts`, logs + optionally webhooks `report=true` high/medium-priority verdicts. |
-| Events API | Real — FastAPI read/ack layer over `events` (§ "out of scope" in the original doc; built per follow-up request). |
+This keeps expensive VLM/LLM inference out of the always-on hot path while preserving an auditable chain from raw perception to final verdict.
 
-## Verified end-to-end result (real chimp footage)
+---
 
-Ran `AlphaChimp/infer_input/demo.mp4` (the repo's own demo clip) through
-Video Ingest → real AlphaChimp → Event Evaluator. The model detected
-and tracked **5 chimps** with stable boxes and real behavior scores
-(`resting` 0.90, `grooming` 0.96, `being groomed` 0.92, ...), and
-`close_proximity` fired for real from genuine tracked positions:
+## Demo highlights
 
+- Chimp **detection, tracking, and 24-class behavior classification** with AlphaChimp.
+- AlphaChimp ported to **ARM64 / NVIDIA DGX Spark / GB10** using a modern NVIDIA PyTorch container and source-built MMCV CUDA ops.
+- Event-driven processing with deterministic temporal rules before VLM/LLM inference.
+- **NVIDIA VSS Kafka** and **VIOS** for messaging and time-based video retrieval.
+- AlphaChimp metadata converted to NVIDIA-native **`nv.Frame` protobuf** and published to `mdx-raw`.
+- **NVIDIA Cosmos-Reason2-8B** for video description.
+- **NVIDIA Nemotron Nano 9B v2 (DGX Spark variant)** for event reasoning and triage.
+- Event persistence in PostgreSQL, optional webhook alerts, and a FastAPI Events API.
+- End-to-end validation on chimp footage and synthetic trigger injection.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A[Video file / dataset footage] --> B[Video Ingest]
+    B <-->|upload| V[VIOS - NVIDIA VSS]
+    B -->|frame windows over HTTP| C[AlphaChimp]
+
+    C -->|alphachimp-events| D[Event Evaluator]
+    C -->|alphachimp-events| N[nv.Frame Adapter]
+
+    N -->|mdx-raw protobuf| BA[VSS Behavior Analytics]
+
+    D -->|candidate-clips| E[Clip Retrieval]
+    E <-->|timeline lookup + clip URL| V
+    E -->|clip-ready| F[Cosmos VLM]
+
+    F -->|vlm-descriptions| G[Nemotron Triage]
+    D -->|candidate-clips| G
+    E -->|clip-ready| G
+
+    G -->|nemotron-verdicts| H[Event Writer]
+    G -->|nemotron-verdicts| I[Alerts]
+
+    H --> J[(PostgreSQL events DB)]
+    J --> K[Events API :8001]
+    I --> L[Logs / optional webhook]
 ```
-event-evaluator: rule fired: close_proximity camera=enc_a tracks=[0, 3] conf=0.92 -> enc_a:1786848261
+
+### System roles
+
+| Layer | Component | Responsibility |
+|---|---|---|
+| Perception | **AlphaChimp** | Detect chimps, track identity, classify behaviors |
+| Cheap triage | **Event Evaluator** | Stateful temporal rules; no LLM in the hot path |
+| Video evidence | **VIOS + Clip Retrieval** | Store video and resolve the exact event window |
+| Description | **Cosmos-Reason2-8B** | Describe what is visibly happening in the clip |
+| Reasoning | **Nemotron Nano 9B v2** | Decide whether the trigger is credible/important |
+| Persistence | **Event Writer + PostgreSQL** | Save every verdict for audit/query |
+| Notification | **Alerts** | Notify only reportable medium/high-priority events |
+| API | **Events API** | Query, filter, acknowledge, or dismiss events |
+| NVIDIA interop | **nv.Frame Adapter** | Publish AlphaChimp metadata in VSS-native format |
+
+---
+
+## Tech stack
+
+### Application
+
+- Python
+- FastAPI / Uvicorn
+- PyTorch
+- OpenCV
+- OpenMMLab: MMEngine, MMDetection/MMTracking/MMAction-style components, MMCV
+- Kafka
+- PostgreSQL
+- Pydantic
+- Protobuf / gRPC tooling
+- Docker / Docker Compose
+- FFmpeg
+
+### NVIDIA
+
+- **NVIDIA DGX Spark** — GB10, ARM64/aarch64
+- **NVIDIA VSS (Video Search & Summarization)** infrastructure
+  - VIOS video ingest/storage
+  - VSS Kafka
+  - `nv.Frame` / `mdx-raw`
+  - VSS Behavior Analytics
+- **NVIDIA NIM**
+  - `nvidia/cosmos-reason2-8b:1.6.0`
+  - `nvidia-nemotron-nano-9b-v2-dgx-spark:1.0.0-variant`
+- NVIDIA PyTorch NGC base image for AlphaChimp ARM64/Blackwell support
+
+---
+
+## Models
+
+### AlphaChimp — perception
+
+AlphaChimp performs:
+
+- chimp detection,
+- ByteTrack-style identity tracking,
+- 24-class multi-label behavior classification.
+
+The deployed checkpoint is `alphachimp_res576.pth`.
+
+Behavior labels:
+
+```text
+other, moving, climbing, resting, sleeping, solitary object playing, eating,
+manipulating object, grooming, being groomed, aggressing, embracing, begging,
+being begged from, taking object, losing object, carrying, being carried,
+nursing, being nursed, playing, touching, erection, displaying
 ```
 
-A separate run injecting a synthetic `aggressing=0.85` trigger onto
-the same real footage's timeline shows the "VLM explains, LLM judges"
-design principle (§1) working as intended — the model doesn't just
-trust the trigger:
+AlphaChimp runs natively in PyTorch inside the `alphachimp` service. 
 
+### Cosmos-Reason2-8B — evidence description
+
+Cosmos receives only clips that pass deterministic event triage. Its job is to describe the visible evidence, not make the final operational decision.
+
+Verified DGX Spark deployment port: **8018**.
+
+### Nemotron Nano 9B v2 — reasoning / triage
+
+Nemotron receives:
+
+- the trigger rule,
+- trigger confidence,
+- track and timing context,
+- the resolved clip,
+- the Cosmos description.
+
+It returns a structured verdict including whether the event should be reported, priority, category, reason, and summary.
+
+The DGX Spark-specific NIM variant is used because it is the supported ARM64 path for this deployment.
+
+Verified DGX Spark deployment port: **30081**.
+
+---
+
+## Event rules
+
+The current Event Evaluator is deterministic and stateful.
+
+```text
+sustained_aggression:
+  behavior == "aggressing"
+  confidence > 0.70
+  duration >= 2.0 seconds
+  same track_id
+
+close_proximity:
+  distance(track_a, track_b) < 150 px
+  duration >= 3.0 seconds
+
+sustained_target_behavior:
+  behavior in {"displaying", "solitary object playing"}
+  confidence > 0.60
+  duration >= 5.0 seconds
 ```
-vlm_summary:     "...chimps are seen sitting and moving slightly on a rope
-                  structure. No direct interaction or physical contact...
-                  The group appears calm..."
-nemotron_reason: "The VLM description indicates no visible aggression or
-                  conflict, with chimps in a calm, relaxed state. The
-                  sustained_aggression trigger was likely a false positive."
-priority: low   report: false
+
+The relevant thresholds are environment-configurable.
+
+---
+
+# Quick start
+
+## 1. Clone the project
+
+```bash
+git clone https://github.com/tristanpalmer07/Sparkathon.git
+cd Sparkathon
 ```
 
-`clip_reference` in that row is a genuine VIOS-served URL; downloading
-and extracting a frame from it confirms it's the real footage (chimps
-on a rope structure), not a filename coincidence.
+## 2. Prerequisites
 
-## Porting AlphaChimp to ARM64/GB10
+The verified full demo runs on an NVIDIA DGX Spark and expects:
 
-The original repo pins `torch==1.9.1+cu111` — x86_64-only wheels, never
-built for ARM64, and incompatible with this box's CUDA 13/Blackwell
-GPU regardless. `services/alphachimp/Dockerfile.pytorch` instead:
+- Docker + Docker Compose
+- NVIDIA Container Toolkit with working GPU access
+- an NVIDIA NGC account/API key with access to the required NIM images
+- NVIDIA VSS infrastructure available
+- the AlphaChimp checkpoint available locally
+- an H.264 input video for VIOS
 
-1. Builds on `nvcr.io/nvidia/pytorch:25.09-py3` (NVIDIA's own PyTorch
-   NGC image — torch 2.9, tested against this exact GPU: `get_device_capability()` → `(12, 1)`).
-2. Compiles `mmcv` (the only dependency with compiled CUDA ops — the
-   vendored mmdet/mmtracking/mmaction fork itself has none) from
-   source against that torch build. **`FORCE_CUDA=1` is load-bearing**:
-   `docker build` has no GPU visible, so mmcv's setup.py — which gates
-   CUDA-extension compilation behind `torch.cuda.is_available()`, not
-   just `MMCV_WITH_OPS` — silently builds CPU-only ops without it
-   (symptom: `ms_deform_attn_impl_forward: implementation for device
-   cuda:0 not found` at inference time, no build-time error).
-3. Skips `decord` (no aarch64 wheels on PyPI at all) — it's only used
-   by a video-reading transform (`DecordInit`/`DecordDecode`) our
-   pipeline never calls, since we feed pre-extracted JPG frames through
-   `RawFrameDecode` instead.
-4. `services/alphachimp/backend.py`'s `PyTorchBackend` reimplements
-   `tools/inference.py`'s `build_model → load_checkpoint → model.eval()`
-   flow as a proper class (per design doc §5.1), adapted for per-window
-   HTTP requests instead of whole-video batch jobs — see its docstring
-   for how it keeps ByteTrack identity continuous across window
-   boundaries despite each window's frame timestamps restarting at 0.
+Verify GPU access:
 
-The checkpoint (`Desktop/big-files/alphachimp_res576.pth`, 1.3GB) is
-mounted read-only into the container, not baked into the image.
+```bash
+nvidia-smi
+docker run --rm --gpus all ubuntu:22.04 nvidia-smi
+```
 
-## VIOS streamId gotcha
+> The AlphaChimp checkpoint and ChimpACT/AlphaChimp dataset are **not committed to this repository**. See [Dataset and model assets](#dataset-and-model-assets).
 
-`streamId` does **not** reliably equal `sensorId` for file-uploaded
-sensors: VIOS only names the *first* upload under a sensorId
-identically to it (`enc_a` → `enc_a`); every subsequent upload under
-the same sensorId becomes a distinct sub-stream with a synthesized ID
-(`enc_a` → `enc_a_enc_a_1786848261`). `shared/vios_client.py`'s
-`find_stream_id()` resolves this correctly by querying
-`GET /storage/timelines` and matching on both camera-id prefix and
-actual timeline overlap with the requested window, rather than
-assuming equivalence.
+## 3. Configure environment
 
-## What's actually running on this box
+Make sure **not** to commit API keys.
 
-Same as before — cherry-picked out of VSS's real compose graph rather
-than a full profile deploy (see prior notes on GPU/memory constraints):
-VIOS, VSS's real Kafka, the two standalone NIMs (each capped at
-`NIM_KVCACHE_PERCENT=0.22` so they share the GB10's 121 GB unified
-memory with AlphaChimp instead of each reserving 40%),
-`vss-behavior-analytics-base`, plus this repo's own services — now
-including AlphaChimp itself as a GPU consumer alongside the two NIMs.
+Example application configuration:
 
-## Running standalone (no VSS, no GPU)
+```dotenv
+# AlphaChimp
+MODEL_BACKEND=pytorch
 
-`MODEL_BACKEND=stub` (motion-blob detection + tracking, synthetic
-behavior scores) still works for local development without a GPU —
-see `services/alphachimp/backend.py`'s `StubBackend`. `cosmos-vlm`/
-`nemotron-triage` fall back to deterministic stub logic when
-`COSMOS_NIM_URL`/`NEMOTRON_NIM_URL` are unset.
+# NVIDIA NIM endpoints used by the verified DGX Spark deployment.
+# If the services are launched outside Docker, localhost may be appropriate.
+# From Docker containers, host.docker.internal is typically used.
+COSMOS_NIM_URL=http://host.docker.internal:8018
+NEMOTRON_NIM_URL=http://host.docker.internal:30081
+
+# Optional outbound notifications
+ALERT_WEBHOOK_URL=
+
+# Event Evaluator thresholds
+AGGRESSION_CONF_THRESHOLD=0.70
+AGGRESSION_MIN_DURATION_S=2.0
+PROXIMITY_THRESHOLD_PX=150
+PROXIMITY_MIN_DURATION_S=3.0
+WATCHLIST_BEHAVIORS=displaying,solitary object playing
+WATCHLIST_CONF_THRESHOLD=0.60
+WATCHLIST_MIN_DURATION_S=5.0
+```
+
+NVIDIA VSS/NIM deployment also requires NGC credentials. Keep them local:
+
+```dotenv
+NGC_API_KEY=<your-ngc-api-key>
+NGC_CLI_API_KEY=<your-ngc-api-key>
+```
+
+For the verified DGX Spark VSS deployment, the important deployment settings included:
+
+```dotenv
+HARDWARE_PROFILE=DGX-SPARK
+
+LLM_MODE=remote
+LLM_BASE_URL=http://localhost:30081
+
+VLM_NAME=nvidia/cosmos-reason2-8b
+VLM_MODE=local_shared
+```
+
+Never commit `.env`, `generated.env`, NGC credentials, model weights, or restricted dataset files.
+
+## 4. Provide the AlphaChimp checkpoint
+
+The   deployment bind-mounts `alphachimp_res576.pth` into the AlphaChimp container.
+
+Place the checkpoint somewhere outside Git and update the read-only bind mount in `docker-compose.yml` to point to that local file.
+
+Example conceptually:
+
+```text
+/path/on/host/alphachimp_res576.pth
+    -> container checkpoint path (read-only)
+```
+
+## 5. Start the application stack
+
+The following is the verified startup sequence **assuming VSS Kafka, VIOS, Cosmos, and Nemotron are already running**:
 
 ```bash
 docker compose up -d postgres
 docker compose run --rm kafka-topics-init
-docker compose up -d event-evaluator nvframe-adapter cosmos-vlm nemotron-triage event-writer alerts events-api
-docker compose run --rm -e SEGMENT_START=$(date +%s) -e TRACK_ID=1 test-client python inject_synthetic_burst.py
-curl http://localhost:8001/events
+docker compose up -d
 ```
+
+The topic initializer is required because the VSS Kafka broker has automatic topic creation disabled.
+
+## 6. Run a   video
+
+VIOS requires the input used in the verified demo to be H.264 encoded.
+
+Place a video under the repository's `data/` directory and run:
+
+```bash
+docker compose run --rm \
+  -e DATASET_PATH=/data/<your-video>.mp4 \
+  video-ingest
+```
+
+For the original AlphaChimp demo footage, the upstream MPEG-4 Part 2 file had to be transcoded before VIOS accepted it:
+
+```bash
+ffmpeg -i demo.mp4 -c:v libx264 -an chimp_demo_h264.mp4
+```
+
+## 7. Check the result
+
+```bash
+curl http://localhost:8001/health
+curl http://localhost:8001/events
+curl http://localhost:8001/stats
+```
+
+You can also poll PostgreSQL through the bundled test client:
+
+```bash
+docker compose run --rm test-client python check_events.py
+```
+
+---
+
+# Reproducing the hackathon demo
+
+There are two useful demo paths.
+
+## A.   footage path
+
+1. Start VSS Kafka, VIOS, Cosmos, Nemotron, and the application stack.
+2. Use `MODEL_BACKEND=pytorch`.
+3. Run an H.264 chimp video through `video-ingest`.
+4. AlphaChimp publishes tracked detections and behavior probabilities.
+5. The Event Evaluator can create candidate events such as `close_proximity`.
+6. Clip Retrieval resolves the matching VIOS time window.
+7. Cosmos describes the clip.
+8. Nemotron judges the trigger against the visual evidence.
+9. The verdict is stored in PostgreSQL.
+10. Query it through `GET /events`.
+
+The verified   demo detected and tracked five chimps and generated   `close_proximity` candidates from model output.
+
+## B. Deterministic downstream test
+
+For a repeatable test of the downstream chain, first upload footage to VIOS, then inject a synthetic behavior burst with a timestamp that overlaps the uploaded video:
+
+```bash
+docker compose run --rm \
+  -e CAMERA_ID=enc_a \
+  -e SEGMENT_START=<epoch-seconds-overlapping-your-uploaded-video> \
+  -e TRACK_ID=<unique-int> \
+  test-client python inject_synthetic_burst.py
+```
+
+This deliberately bypasses AlphaChimp for the trigger while still exercising:
+
+```text
+Kafka
+→ Event Evaluator
+→ VIOS clip lookup
+→ Cosmos
+→ Nemotron
+→ Event Writer
+→ PostgreSQL
+→ Events API
+```
+
+This path was used to verify that the reasoning stage can reject a false trigger when the visual evidence does not support it.
+
+---
 
 ## Kafka topics
 
-Ours: `alphachimp-events`, `candidate-clips`, `clip-ready`,
-`vlm-descriptions`, `nemotron-verdicts` (schemas in `shared/schemas.py`,
-frozen per design doc §4.1/§4.2), bootstrapped by `scripts/init_topics.py`.
+The custom pipeline uses the   VSS Kafka broker.
 
-VSS-native: `mdx-raw` (written by `nvframe-adapter`, consumed live by
-`vss-behavior-analytics-base`).
+| Topic | Producer | Consumer(s) |
+|---|---|---|
+| `alphachimp-events` | AlphaChimp | Event Evaluator, nv.Frame Adapter |
+| `candidate-clips` | Event Evaluator | Clip Retrieval, Nemotron Triage |
+| `clip-ready` | Clip Retrieval | Cosmos VLM, Nemotron Triage |
+| `vlm-descriptions` | Cosmos VLM | Nemotron Triage |
+| `nemotron-verdicts` | Nemotron Triage | Event Writer, Alerts |
+| `mdx-raw` | nv.Frame Adapter | VSS Behavior Analytics |
+
+The `mdx-raw` messages are binary NVIDIA `nv.Frame` protobufs using the VSS schema.
+
+---
 
 ## Events API
 
+Base URL:
+
+```text
+http://localhost:8001
 ```
-GET  /events?priority=&status=&category=&camera_id=&limit=&offset=
-GET  /events/{event_id}
-PATCH /events/{event_id}   {"status": "acknowledged" | "dismissed" | "new"}
-GET  /stats                 -- counts grouped by (priority, status)
-GET  /health
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/health` | Liveness/database check |
+| `GET` | `/events` | List events with optional filters |
+| `GET` | `/events/{event_id}` | Fetch one event |
+| `PATCH` | `/events/{event_id}` | Set status to `new`, `acknowledged`, or `dismissed` |
+| `GET` | `/stats` | Aggregate counts by priority/status |
+
+Example:
+
+```bash
+curl "http://localhost:8001/events?priority=high&status=new"
 ```
-Port 8001.
+
+Acknowledge an event:
+
+```bash
+curl -X PATCH "http://localhost:8001/events/<event_id>" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"acknowledged"}'
+```
+
+---
 
 ## Alerts
 
-Consumes `nemotron-verdicts`; logs (and optionally POSTs to
-`ALERT_WEBHOOK_URL`, unset by default) every `report=true` verdict at
-`priority in {high, medium}`. `low`-priority verdicts still land in
-Postgres via Event Writer — they're just not paged.
+The Alerts service is an independent Kafka consumer, so notification failures cannot block event persistence.
 
-## Frontend
+An alert is emitted only when:
 
-A containerized React/Vite dashboard (`services/frontend`) plus a new
-`services/ingest-api` backend that gives the previously CLI-only
-`video-ingest` job an HTTP front door — port 3000.
-
-- **Flagged Events tab**: filterable/searchable table over the Events
-  API (priority, status, category, camera), stats bar, and a detail
-  drawer per event with inline clip playback (`clip_reference` is a
-  real VIOS-served URL) plus VLM description, Nemotron reasoning, and
-  Acknowledge/Dismiss controls.
-- **Videos tab**: browse the bundled ChimpACT demo library (mounted
-  read-only from `Desktop/big-files/ChimpACT_release_v1/videos_full`)
-  or upload your own file; assign a `camera_id` and click Ingest.
-  `ingest-api` transcodes non-H.264 sources automatically (the
-  ChimpACT files are `mpeg4` — see bug #15) and drives
-  `docker compose run video-ingest` over the mounted host Docker
-  socket, with a live job log per run.
-
-```bash
-docker compose build ingest-api frontend
-docker compose up -d ingest-api frontend
-open http://localhost:3000
+```text
+report == true
+AND
+priority in {"high", "medium"}
 ```
 
-`ingest-api` (port 8002) needs `/var/run/docker.sock` and this
-project directory bind-mounted at its own identical host path — see
-`services/ingest-api/main.py`'s module docstring for why (docker-
-outside-of-docker path resolution).
+If `ALERT_WEBHOOK_URL` is unset, alerts are logged only.
 
-## Known gaps
+If configured, the service POSTs a JSON payload containing the event ID, camera, priority, category, summary, reason, and clip URI.
 
-- `vss-behavior-analytics-base`'s 0-incident output is by design — its
-  native incident types (proximity/restrictedArea/confinedArea) don't
-  cover "sustained behavior-class confidence," which is why the custom
-  Event Evaluator exists per §6's original design call. It IS
-  genuinely consuming our real detections (confirmed via its logs
-  referencing `sensor enc_a`).
-- The demo footage used for validation doesn't contain a genuinely
-  aggressive incident, so the alerts path's `report=true` branch is
-  exercised by unit-level reasoning (Nemotron correctly downgrading a
-  synthetic false trigger) rather than a real high-priority alert
-  firing end-to-end. The mechanism itself (`services/alerts/main.py`)
-  is simple and was verified to correctly filter on priority.
-- Track-ID continuity across AlphaChimp inference windows is
-  best-effort (see `PyTorchBackend`'s docstring) — sound for a
-  microservice adaptation of a whole-video-batch model, not identical
-  to running the model on a continuous stream.
+---
 
-## Tests
+## Repository layout
+
+```text
+.
+├── services/
+│   ├── video-ingest/
+│   ├── alphachimp/
+│   ├── event-evaluator/
+│   ├── nvframe-adapter/
+│   ├── clip-retrieval/
+│   ├── cosmos-vlm/
+│   ├── nemotron-triage/
+│   ├── event-writer/
+│   ├── alerts/
+│   └── events-api/
+├── shared/
+│   ├── schemas.py
+│   ├── topics.py
+│   ├── kafka_utils.py
+│   └── vios_client.py
+├── db/
+│   └── migrations/
+├── scripts/
+│   ├── init_topics.py
+│   ├── inject_synthetic_burst.py
+│   └── check_events.py
+├── data/
+└── docker-compose.yml
+```
+
+---
+
+# Dataset and model assets
+
+## AlphaChimp / ChimpACT data
+
+The AlphaChimp/ChimpACT dataset is **not redistributed in this repository**, and this README intentionally does **not** publish or mirror the restricted dataset URL.
+
+The dataset provider distributes the data under **CC BY-NC 4.0** and requires users to comply with the accompanying access agreement:
+
+1. Give appropriate credit, provide a link to the license, and indicate if changes were made.
+2. Do not use the material for commercial purposes.
+3. If you remix, transform, or build upon the material, distribute your contributions under the same license as the original.
+
+License: https://creativecommons.org/licenses/by-nc/4.0/
+
+Obtain the dataset only through the official provider/access process and follow the provider's terms. Do not re-upload or share the private download URL.
+
+## AlphaChimp checkpoint
+
+The ~1.3 GB AlphaChimp checkpoint used by the full demo is stored outside Git and bind-mounted at runtime.
+
+It is not included in this repository.
+
+##   demo footage
+
+The verified end-to-end  -footage test used the demo video included with the upstream AlphaChimp project. Because VIOS rejected its original MPEG-4 Part 2 encoding, the video was locally transcoded to H.264 before upload.
+
+Any redistributed footage must follow its upstream license and usage terms.
+
+## Synthetic data
+
+Two synthetic test mechanisms were used:
+
+### FFmpeg `testsrc`
+
+An FFmpeg-generated test pattern was uploaded to VIOS to verify storage, time-based clip retrieval, Kafka plumbing, Cosmos invocation, Nemotron invocation, and PostgreSQL persistence without using animal footage.
+
+### Synthetic behavior burst
+
+`scripts/inject_synthetic_burst.py` publishes a controlled behavior sequence into the pipeline. It is used for deterministic integration testing of the downstream event path.
+
+Synthetic data is clearly separated from   model detections and is not presented as   animal behavior.
+
+---
+
+# What was verified
+
+The project has been exercised end-to-end on the DGX Spark:
+
+- AlphaChimp model construction and checkpoint loading.
+-   GPU inference on chimp footage.
+- Five simultaneously tracked chimps with stable IDs over frames.
+-   behavior probabilities.
+-   Event Evaluator `close_proximity` triggers.
+-  Kafka traffic on the VSS broker.
+- Valid VSS `nv.Frame` protobuf messages on `mdx-raw`.
+- VIOS upload, timeline discovery, and clip URL resolution.
+- Cosmos-Reason2-8B description of  chimp footage.
+- Nemotron reasoning over the trigger + VLM evidence.
+- PostgreSQL persistence.
+- Events API reads.
+- Alert filter behavior.
+
+A particularly useful integration test injected a synthetic aggression trigger over calm  footage. Cosmos described the clip as calm/no visible aggression, and Nemotron downgraded the event as a likely false positive instead of blindly trusting the rule trigger.
+
+---
+
+# Known limitations
+
+- **AlphaChimp Model Latency** The model currently runs on all frames of the input. The model is quite heavy, and therefore some microservice should be placed infront of it.
+
+- **RTSP Live streams** There is a need for parrallelism especially in the context of multi-camera live stream infrastructure
+- **Reasoning behind profile chnages** Ideally, the system instructions of the model should be to figure out why the behavior changed the way it did.
+
+- **No naturally occurring high-priority aggression incident was available in the demo footage.**  footage validated detection/tracking and proximity events; the full aggression reasoning chain was exercised deterministically with synthetic trigger injection over  video.
+- **VSS Behavior Analytics is not a replacement for the custom Event Evaluator.** Its native incidents are primarily spatial/zone-oriented, whereas the custom evaluator operates on sustained AlphaChimp behavior probabilities.
+- **GPU memory is constrained.** On the verified 121 GB unified-memory DGX Spark, Cosmos and Nemotron were each configured around a 0.22 NIM KV-cache fraction so that AlphaChimp could coexist.
+- **Model weights and restricted dataset files are external assets.** They are intentionally not tracked in Git.
+
+
+---
+
+# Next steps
+
+
+- Add authenticated API access and operator roles.
+- Validate on more diverse chimp behavior, especially naturally occurring high-severity events.
+- Tune the models and priority levels.
+- Calibrate event thresholds against labeled evaluation data.
+- Improve cross-window / long-running track identity stability.
+- Add stronger automated integration tests for Kafka → VIOS → VLM → LLM → DB.
+- Add observability for latency, Kafka lag, GPU utilization, and per-stage failure rates.
+- Package the NVIDIA VSS/NIM bootstrapping into a repeatable deployment script/profile.
+- Improve UI
+- Testing to determine what model quantization and parameter size give adequate analysis whilst running efficiently on edge hardware for RTSP streams
+
+---
+
+# Tests
+
+Run the current unit tests:
 
 ```bash
-python3 -m pytest services/event-evaluator/tests/ services/nvframe-adapter/tests/ -q
+python3 -m pytest \
+  services/event-evaluator/tests/ \
+  services/nvframe-adapter/tests/ \
+  -q
 ```
+
+---
+
+## Acknowledgements
+
+This project integrates work and infrastructure from:
+
+- **NVIDIA** — DGX Spark, VSS, VIOS, NIM, Cosmos-Reason2, Nemotron, and NVIDIA PyTorch containers.
+- **AlphaChimp** — chimpanzee detection, tracking, and behavior recognition model/checkpoint.
+- **AlphaChimp dataset providers** — research dataset used under the provider's non-commercial access terms.
+
+Please cite and comply with the original projects and dataset licenses when using their assets.
+
+
+
